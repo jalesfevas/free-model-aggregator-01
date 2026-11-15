@@ -1,5 +1,5 @@
 // free-model-aggregator-01 entry: one server, two client wires, three provider wires,
-// quality-first routing with attempt-risk-aware failover.
+// call-minimising routing under the quality-98 floor.
 //
 // Node 22, standard library only, no npm dependencies, nothing fetched at runtime.
 // Run:  node main.ts            (inside a trial: reads $MAKEFUN_PROMPT_FILE, probes the
@@ -8,15 +8,14 @@
 //       node main.ts --list     (prints the catalog document byte-for-byte as registered,
 //                                {"providers":[]} with no brief)
 //
-// Routing design lives in STRATEGY.md. In short: every request is answered by the
-// highest-rated free model that meets it; when several providers are equivalent the
-// router spreads calls by each provider's refusal risk (fail numbers are drawn into
-// the narrow free-tier windows of small providers, one designated provider refuses
-// its second call, one provider suffers an outage, and every spent call still
-// consumes a call number), subject to a weighted-quality budget that keeps the
-// trial's quality column at its cap. Refusal messages ("budget is spent", "is out",
-// "refused this call") update the observed state; nothing depends on the wall clock
-// or on randomness, so the trial replays byte for byte.
+// Routing design lives in STRATEGY.md. In short: score 99 needs weighted quality 98
+// or 99 alike once the other columns sit at 100, so the router plans the whole
+// manifest up front with a min-cost-flow matcher - weighted loss plus scaled refusal
+// risk against the quality-98 loss budget - and re-plans from the observed state
+// after every refusal ("budget is spent" / "is out" kill a provider, "refused this
+// call" burns one of its at most two scheduled fail numbers and puts a surcharge on
+// its deeper numbers). Nothing depends on the wall clock or on randomness, so the
+// trial replays byte for byte.
 
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -43,15 +42,33 @@ const GUARD_EXIT_MS = 168000; // well inside the trial's 180 s wall
 // refused call still consumes its call number, so depth on a narrow-window provider
 // is risky while the first call to any provider is always safe. These bounds shape
 // the risk estimate only; observed refusals override them.
-const TIER_BOUNDS = {
+const TIER_BOUNDS: Record<string, [number, number]> = {
   groq: [9, 12], cerebras: [5, 6], gemini: [6, 8], zai: [4, 5],
   openrouter: [10, 12], sambanova: [4, 5], pollinations: [10, 14],
   cloudflare: [7, 8], ovh: [5, 6], kilol: [12, 16],
 };
 const DESIGNATED_PRIOR = 0.1; // one provider of ten refuses its second call
 const OUTAGE_PRIOR = 0.1; // one provider of ten goes out mid-trial
-const LAMBDA = 1 / 40; // attempts traded against weighted quality loss inside the budget
-const RESERVE_FRACTION = 0.15; // quality budget held back against capacity surprises
+// Tuning knobs (dev sweeps set FMA01_*; a trial sets none of them).
+const envNum = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  const value = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+};
+const FAIL_MASS = envNum('FMA01_FAIL_MASS', 1.5); // expected scheduled fail numbers ahead on an untouched provider
+const FAIL_MASS_AFTER = envNum('FMA01_FAIL_MASS_AFTER', 0.7); // ... after one observed "refused this call"
+const REFUSED_SURCHARGE = envNum('FMA01_REFUSED_SURCHARGE', 0.2); // extra risk per deep call past a provider's first refusal
+// The planner minimises provider calls subject to the quality floor: the score is
+// round((60*quality + 400)/100) once the other columns sit at 100, so weighted
+// quality 98 and 99 both round to 99 - the router may spend up to 2% of the
+// trial's quality points to keep every request at one successful upstream call.
+const QUALITY_FLOOR = 0.98;
+const LOSS_RESERVE = envNum('FMA01_LOSS_RESERVE', 0); // loss budget held back against re-plan drift
+const RISK_SCALE = envNum('FMA01_RISK_SCALE', 3000); // milli-rating paid per unit of refusal risk in the plan
+const DEEP_CAP = envNum('FMA01_DEEP_CAP', 4); // planned depth (calls past the first) per provider, from risk
+const DEEP_SLACK = envNum('FMA01_DEEP_SLACK', 4); // spare planned calls against surprises
+const EMERGENCY_RISK = envNum('FMA01_EMERGENCY_RISK', 0.5); // flat risk surcharge on slots past the plan
+const EMERGENCY_EXTRA = 3; // slots added beyond the plan when the plan runs dry
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -713,6 +730,7 @@ interface ProviderState {
   key: string;
   next: number; // the next call number this trial will hand this provider
   dead: boolean;
+  refusedFrom: number | null; // call number after this provider's first scheduled refusal
   observedFails: number; // scheduled refusals seen on this provider (its schedule holds at most 2)
   servedSecond: boolean; // its call number 2 already succeeded: no designated refusal there
 }
@@ -722,14 +740,17 @@ interface RequestInfo {
   requires: Json;
   weight: number;
   top: number; // best free rating meeting the requirements (the quality bound)
+  model: string | null; // the model the current plan picked on the assigned provider
+  provider: number; // assigned provider index (-1: unassigned)
 }
 
 interface Runtime {
   catalog: Catalog;
   providers: ProviderState[];
   requests: RequestInfo[];
-  lossThreshold: number; // weighted loss at which the quality column still floors to its cap
-  lossSoFar: number;
+  lossBudget: number; // weighted loss at which the quality column still floors to 98
+  lossSoFar: number; // weighted loss already sunk on served requests
+  plannedMax: number[]; // highest call number the planner will attempt per provider
   manifestIndex: number;
   callChain: Promise<unknown>;
 }
@@ -738,8 +759,9 @@ const runtime: Runtime = {
   catalog: EMPTY_CATALOG,
   providers: [],
   requests: [],
-  lossThreshold: 0,
+  lossBudget: 0,
   lossSoFar: 0,
+  plannedMax: [],
   manifestIndex: 0,
   callChain: Promise.resolve(),
 };
@@ -794,7 +816,7 @@ function buildRequestInfos(): RequestInfo[] {
     if (top === 0) {
       for (const row of rows) if (meetsRequirements(row, requires)) top = Math.max(top, row.rating);
     }
-    infos.push({ id: raw.id, requires, weight: raw.weight === 2 ? 2 : 1, top });
+    infos.push({ id: raw.id, requires, weight: raw.weight === 2 ? 2 : 1, top, model: null, provider: -1 });
   }
   return infos;
 }
@@ -809,68 +831,229 @@ function bestModelOn(providerId: string, requires: Json, rows: RatingRow[]): Rat
   return best;
 }
 
+/** Sealed rating of one model on one provider (null when the table lacks it). */
+function ratingOf(providerId: string, model: string): number | null {
+  for (const row of ratingRows()) {
+    if (row.provider === providerId && row.model === model) return row.rating;
+  }
+  return null;
+}
+
 /** Estimated refusal probability of one attempt at call number n on this provider. */
 function pRefuse(provider: ProviderState, n: number): number {
   if (n <= 1) return 0;
   const bounds = TIER_BOUNDS[provider.id] ?? [4, 12];
   const [lo, hi] = bounds;
-  const range = Math.max(1, (lo + hi) / 2 - 2);
-  let p = Math.max(0, 1.5 - Math.min(2, provider.observedFails)) / range; // its 1-2 scheduled fail numbers
-  if (n === 2 && !provider.servedSecond) p += DESIGNATED_PRIOR; // one provider of ten refuses its second call
-  p += OUTAGE_PRIOR * Math.max(0, n - 1) / range; // one provider of ten goes out from a drawn number on
-  p += Math.max(0, n - lo) / (hi - lo + 1); // the budget itself is drawn in [lo, hi]
+  const mid = (lo + hi) / 2;
+  const mass = provider.observedFails === 0 ? FAIL_MASS : FAIL_MASS_AFTER;
+  let p = mass / Math.max(1, mid - n + 1); // its 1-2 scheduled fail numbers
+  if (provider.refusedFrom !== null) p += REFUSED_SURCHARGE * Math.max(0, n - provider.refusedFrom);
+  if (n === 2 && !provider.servedSecond && provider.observedFails === 0) p += DESIGNATED_PRIOR;
+  p += OUTAGE_PRIOR / Math.max(1, mid - 2); // one provider of ten goes out, number unknown
+  if (n > lo) p += (n - lo) / (hi - lo + 1); // the budget itself is drawn in [lo, hi]
   return Math.min(1, p);
 }
 
-/** Cheapest possible weighted loss for every remaining request, over the alive providers. */
-function futureReserve(fromIndex: number): number {
-  const rows = ratingRows();
-  let sum = 0;
-  for (let j = fromIndex + 1; j < runtime.requests.length; j++) {
-    const request = runtime.requests[j];
-    let minLoss = 0;
-    let first = true;
-    for (const provider of runtime.providers) {
-      if (provider.dead) continue;
-      const best = bestModelOn(provider.id, request.requires, rows);
-      if (best === null) continue;
-      const loss = request.weight * Math.max(0, request.top - best.rating);
-      if (first || loss < minLoss) { minLoss = loss; first = false; }
-    }
-    sum += minLoss;
+// ------------------------------------------------------- min-cost-flow planner
+// Every remaining request is matched to one provider call slot; the plan minimises
+// weighted quality loss plus scaled refusal risk, and never lets the planned loss
+// cross the quality-98 budget. Providers fill their call numbers in order, so the
+// k-th call this trial pays pRefuse(provider, next + k - 1).
+
+interface FlowEdge { to: number; cap: number; cost: number; rev: number }
+
+class MinCostFlow {
+  graph: FlowEdge[][] = [];
+  add(from: number, to: number, cap: number, cost: number): FlowEdge {
+    const forward: FlowEdge = { to, cap, cost, rev: this.graph[to].length };
+    this.graph[from].push(forward);
+    this.graph[to].push({ to: from, cap: 0, cost: -cost, rev: this.graph[from].length - 1 });
+    return forward;
   }
-  return sum;
+  /** Successive shortest paths (SPFA/Bellman-Ford); costs may be negative. */
+  solve(source: number, sink: number, want: number): { flow: number; cost: number } {
+    const n = this.graph.length;
+    let flow = 0;
+    let cost = 0;
+    const INF = Number.MAX_SAFE_INTEGER;
+    while (flow < want) {
+      const dist = new Array<number>(n).fill(INF);
+      const inQueue = new Array<boolean>(n).fill(false);
+      const prevNode = new Array<number>(n).fill(-1);
+      const prevEdge = new Array<number>(n).fill(-1);
+      dist[source] = 0;
+      const queue: number[] = [source];
+      inQueue[source] = true;
+      while (queue.length > 0) {
+        const u = queue.shift() as number;
+        inQueue[u] = false;
+        for (let k = 0; k < this.graph[u].length; k++) {
+          const e = this.graph[u][k];
+          if (e.cap > 0 && dist[u] + e.cost < dist[e.to]) {
+            dist[e.to] = dist[u] + e.cost;
+            prevNode[e.to] = u;
+            prevEdge[e.to] = k;
+            if (!inQueue[e.to]) { queue.push(e.to); inQueue[e.to] = true; }
+          }
+        }
+      }
+      if (dist[sink] >= INF) break;
+      let push = want - flow;
+      for (let v = sink; v !== source; v = prevNode[v]) push = Math.min(push, this.graph[prevNode[v]][prevEdge[v]].cap);
+      for (let v = sink; v !== source; v = prevNode[v]) {
+        const e = this.graph[prevNode[v]][prevEdge[v]];
+        e.cap -= push;
+        this.graph[e.to][e.rev].cap += push;
+      }
+      flow += push;
+      cost += push * dist[sink];
+    }
+    return { flow, cost };
+  }
 }
 
-interface Candidate { provider: ProviderState; model: string; loss: number; p: number; key: number }
+interface PlanEdge { unit: number; provider: number; model: string; loss: number }
 
-function rankedCandidates(requestIndex: number): Candidate[] {
-  const request = runtime.requests[requestIndex];
-  if (request === undefined || request.top <= 0) return [];
+interface FlowRefs {
+  flow: MinCostFlow;
+  unitEdge: (FlowEdge | null)[][]; // unitEdge[u][j]: forward edge unit u -> provider j
+  units: number[];
+  sink: number;
+}
+
+/**
+ * Build the matching graph: source -> units -> providers -> sink. Unit edges carry
+ * the weighted loss (scaled by mu when the plan must be pulled back into the
+ * quality budget); provider->sink parallel edges carry RISK_SCALE * the refusal
+ * risk of each call number the provider would spend, priced in ascending order so
+ * the successive-shortest-path solver always spends the safest numbers first.
+ */
+function buildFlow(fromUnit: number, mu: number): FlowRefs {
   const rows = ratingRows();
-  const room = runtime.lossThreshold - runtime.lossSoFar - futureReserve(requestIndex) - RESERVE_FRACTION * runtime.lossThreshold;
-  const candidates: Candidate[] = [];
+  const units: number[] = [];
+  for (let i = fromUnit; i < runtime.requests.length; i++) {
+    if (runtime.requests[i].top > 0) units.push(i);
+  }
+  const P = runtime.providers.length;
+  const sink = 1 + units.length + P;
+  const flow = new MinCostFlow();
+  for (let s = 0; s <= sink; s++) flow.graph.push([]);
+  for (let u = 0; u < units.length; u++) flow.add(0, 1 + u, 1, 0);
+  const unitEdge: (FlowEdge | null)[][] = [];
+  for (let u = 0; u < units.length; u++) {
+    const request = runtime.requests[units[u]];
+    unitEdge.push([]);
+    for (const provider of runtime.providers) {
+      const best = provider.dead ? null : bestModelOn(provider.id, request.requires, rows);
+      if (best === null) { unitEdge[u].push(null); continue; }
+      const loss = request.weight * Math.max(0, request.top - best.rating);
+      const edge = flow.add(1 + u, 1 + units.length + provider.index, 1, loss * 64 * mu);
+      unitEdge[u].push(edge);
+    }
+  }
   for (const provider of runtime.providers) {
     if (provider.dead) continue;
-    const best = bestModelOn(provider.id, request.requires, rows);
-    if (best === null) continue;
-    candidates.push({
-      provider,
-      model: best.model,
-      loss: request.weight * Math.max(0, request.top - best.rating),
-      p: pRefuse(provider, provider.next),
-      key: 0,
-    });
+    const slots = runtime.plannedMax[provider.index] - provider.next + 1 + EMERGENCY_EXTRA;
+    // The planner spends call numbers in order, so slot costs must ascend for the
+    // successive-shortest-path solver to consume them in that order: price each
+    // slot at the worst risk seen so far on this provider (the number-2 designated
+    // bump then stays honestly counted on every deeper call). Slots past the plan
+    // carry a steep surcharge: the quality budget may buy them back when refusals
+    // have eaten the planned capacity, but risk-first plans leave them alone.
+    let worst = 0;
+    for (let k = 0; k < slots; k++) {
+      const number = provider.next + k;
+      worst = Math.max(worst, pRefuse(provider, number));
+      const over = k >= runtime.plannedMax[provider.index] - provider.next + 1 ? EMERGENCY_RISK : 0;
+      flow.add(1 + units.length + provider.index, sink, 1, Math.round(RISK_SCALE * (worst + over) * 64) + k);
+    }
   }
-  const safe = candidates.filter((c) => c.loss <= room);
-  const pool = safe.length > 0 ? safe : [...candidates].sort((a, b) => a.loss - b.loss || b.model.localeCompare(a.model));
-  for (const c of pool) {
-    const share = 1 - (runtime.lossSoFar + c.loss) / Math.max(1, runtime.lossThreshold);
-    const eff = LAMBDA / Math.max(0.1, share);
-    c.key = 1 + c.p + eff * c.loss;
+  return { flow, unitEdge, units, sink };
+}
+
+function planAssignment(fromUnit: number, budget: number): { edges: PlanEdge[]; loss: number; feasible: boolean } {
+  let mu = 1;
+  let edges: PlanEdge[] = [];
+  let loss = Number.MAX_SAFE_INTEGER;
+  for (let round = 0; round < 14; round++) {
+    const refs = buildFlow(fromUnit, mu);
+    refs.flow.solve(0, refs.sink, refs.units.length);
+    edges = [];
+    loss = 0;
+    for (let u = 0; u < refs.units.length; u++) {
+      for (let j = 0; j < runtime.providers.length; j++) {
+        const e = refs.unitEdge[u][j];
+        if (e === null || e.cap > 0) continue;
+        const request = runtime.requests[refs.units[u]];
+        const model = bestModelOn(runtime.providers[j].id, request.requires, ratingRows());
+        if (model === null) continue;
+        const unitLoss = request.weight * Math.max(0, request.top - model.rating);
+        edges.push({ unit: refs.units[u], provider: j, model: model.model, loss: unitLoss });
+        loss += unitLoss;
+        break;
+      }
+    }
+    if (SIM_DEBUG) {
+      process.stderr.write(`sim: plan from r${fromUnit + 1} mu=${mu} loss=${loss} budget=${budget} units=${refs.units.length}\n`);
+      if (SIM_DEBUG && mu >= 4096) {
+        for (const edge of edges) process.stderr.write(`sim:   r${edge.unit + 1} -> ${runtime.providers[edge.provider].id} (${edge.model}, loss ${edge.loss})\n`);
+      }
+    }
+    if (loss <= budget || mu >= 4096) break;
+    mu *= 2;
   }
-  pool.sort((a, b) => a.key - b.key || b.provider.next - a.provider.next || a.provider.index - b.provider.index);
-  return pool;
+  return { edges, loss, feasible: loss <= budget };
+}
+
+/** Rebuild the plan for every request that still needs an answer. */
+function replan(fromUnit: number): void {
+  const budget = Math.max(0, Math.floor((runtime.lossBudget - runtime.lossSoFar) * (1 - LOSS_RESERVE)));
+  for (let round = 0; round < 6; round++) {
+    const plan = planAssignment(fromUnit, budget);
+    const assigned = new Map<number, PlanEdge>();
+    for (const edge of plan.edges) assigned.set(edge.unit, edge);
+    let unassigned = 0;
+    for (let i = fromUnit; i < runtime.requests.length; i++) {
+      const edge = assigned.get(i);
+      runtime.requests[i].provider = edge === undefined ? -1 : edge.provider;
+      runtime.requests[i].model = edge === undefined ? null : edge.model;
+      if (edge === undefined) unassigned += 1;
+    }
+    if (unassigned === 0) return;
+    // the plan ran dry: widen the deepest planners up to the sealed budget bounds
+    let widened = false;
+    for (const provider of runtime.providers) {
+      if (provider.dead) continue;
+      const [lo, hi] = TIER_BOUNDS[provider.id] ?? [4, 12];
+      const room = hi + EMERGENCY_EXTRA - runtime.plannedMax[provider.index];
+      if (room > 0) {
+        runtime.plannedMax[provider.index] += Math.min(room, Math.max(1, unassigned));
+        widened = true;
+      }
+    }
+    if (!widened) return;
+  }
+}
+
+/** Planned depth per provider: buy the cheapest marginal call numbers first. */
+function computePlannedCaps(): void {
+  const P = runtime.providers.length;
+  const plannedMax = new Array<number>(P).fill(1);
+  const target = Math.max(0, runtime.requests.length - P) + DEEP_SLACK;
+  for (let bought = 0; bought < target; bought++) {
+    let bestProvider = -1;
+    let bestCost = Number.MAX_SAFE_INTEGER;
+    for (let j = 0; j < P; j++) {
+      const provider = runtime.providers[j];
+      if (provider.dead) continue;
+      if (plannedMax[j] >= 1 + DEEP_CAP) continue;
+      const cost = pRefuse(provider, plannedMax[j] + 1);
+      if (cost < bestCost) { bestCost = cost; bestProvider = j; }
+    }
+    if (bestProvider < 0) break;
+    plannedMax[bestProvider] += 1;
+  }
+  runtime.plannedMax = plannedMax;
 }
 
 function classifyRefusal(message: string): 'budget' | 'outage' | 'scheduled' | 'unknown' {
@@ -919,24 +1102,34 @@ async function serveCanonical(canonical: CanonicalRequest, requestIndex: number)
 }
 
 async function doServe(canonical: CanonicalRequest, requestIndex: number): Promise<{ status: number; contentType: string; body: string }> {
-  // One attempt at a time; after every refusal the ranking is rebuilt from the
-  // observed state, so the next attempt is always the currently best trade.
+  // One attempt at a time; the plan is rebuilt from the observed state before every
+  // attempt, so after a refusal the next provider is always the currently best trade.
+  const request = runtime.requests[requestIndex];
   for (let round = 0; round < 40; round++) {
-    const candidates = rankedCandidates(requestIndex);
-    if (candidates.length === 0) break;
-    const choice = candidates[0];
-    const answer = await callProvider(choice.provider, choice.model, canonical);
+    if (request.provider < 0 || runtime.providers[request.provider].dead || request.model === null) {
+      replan(requestIndex);
+    }
+    if (request.provider < 0 || request.model === null) break;
+    const choice = runtime.providers[request.provider];
+    const model = request.model as string;
+    const answer = await callProvider(choice, model, canonical);
     if (answer.ok && answer.usage !== null) {
-      if (choice.provider.next - 1 === 2) choice.provider.servedSecond = true;
-      runtime.lossSoFar += choice.loss;
+      if (choice.next - 1 === 2) choice.servedSecond = true;
+      runtime.lossSoFar += request.weight * Math.max(0, request.top - (ratingOf(choice.id, request.model as string) ?? request.top));
       return clientResponseFor(canonical, {
         model: answer.model, text: answer.text, toolCalls: answer.toolCalls, stop: answer.stop, usage: answer.usage,
       });
     }
     if (answer.refused) {
       const kind = classifyRefusal(answer.message);
-      if (kind === 'budget' || kind === 'outage') choice.provider.dead = true;
-      else if (kind === 'scheduled') choice.provider.observedFails += 1;
+      if (kind === 'budget' || kind === 'outage') choice.dead = true;
+      else if (kind === 'scheduled') {
+        choice.observedFails += 1;
+        if (choice.refusedFrom === null) choice.refusedFrom = choice.next;
+      }
+      replan(requestIndex);
+    } else {
+      break; // not a refusal the schedule explains: hand the error back
     }
   }
   return clientErrorAnswer(canonical.api, 502, 'no provider answered this request');
@@ -1039,6 +1232,87 @@ function startServer(): Promise<number> {
 
 // -------------------------------------------------------------- trial driver
 
+// In-process simulation mode (tuning tooling; MAKEFUN_SIM_TRIAL is never set by a
+// trial): the providers' refusal schedules are read from a JSON file and the
+// planner is exercised against them without HTTP. Prints one JSON result line.
+const SIM_TRIAL = process.env.MAKEFUN_SIM_TRIAL ?? '';
+const SIM_DEBUG = process.env.FMA01_SIM_DEBUG === '1';
+
+interface SimRow { id: string; budget: number; fail_calls: number[]; outage_from: number | null }
+
+function simCall(provider: ProviderState, model: string): ProviderAnswer {
+  const row = SIM_ROWS.get(provider.id) as SimRow;
+  const number = provider.next;
+  provider.next = number + 1;
+  const refused = number > row.budget ? `${provider.id}'s free-tier budget is spent`
+    : row.outage_from !== null && number >= row.outage_from ? `${provider.id} is out`
+    : row.fail_calls.includes(number) ? `${provider.id} refused this call` : null;
+  if (refused !== null) return { ok: false, status: 429, refused: true, message: refused, text: '', toolCalls: [], stop: '', usage: null, model };
+  return { ok: true, status: 200, refused: false, message: '', text: 'ANSWER ECHO', toolCalls: [], stop: 'stop', usage: { input: 1, output: 1 }, model };
+}
+
+async function simMain(): Promise<void> {
+  const rows: SimRow[] = JSON.parse(readFileSync(SIM_TRIAL, 'utf8'));
+  SIM_ROWS.clear();
+  for (const row of rows) SIM_ROWS.set(row.id, row);
+  runtime.catalog = { providers: [] };
+  runtime.requests = buildRequestInfos();
+  let bound = 0;
+  for (const request of runtime.requests) bound += request.weight * request.top;
+  runtime.lossBudget = Math.floor((1 - QUALITY_FLOOR) * bound);
+  const directory = isRecord(brief.directory) && Array.isArray(brief.directory.providers) ? brief.directory.providers : [];
+  runtime.providers = directory.map((p: Json, index: number) => ({
+    index,
+    id: isRecord(p) && typeof p.id === 'string' ? p.id : `unknown-${index}`,
+    wire: isRecord(p) && typeof p.wire === 'string' ? p.wire : 'openai',
+    auth: isRecord(p) && typeof p.auth === 'string' ? p.auth : 'none',
+    path: isRecord(p) && typeof p.path === 'string' ? p.path : '',
+    key: '',
+    next: 1,
+    dead: false,
+    refusedFrom: null,
+    observedFails: 0,
+    servedSecond: false,
+  }));
+  computePlannedCaps();
+  replan(0);
+  let calls = 0;
+  let served = 0;
+  let loss = 0;
+  for (let i = 0; i < runtime.requests.length; i++) {
+    const request = runtime.requests[i];
+    for (let round = 0; round < 40; round++) {
+      if (request.provider < 0 || runtime.providers[request.provider].dead || request.model === null) replan(i);
+      if (request.provider < 0 || request.model === null) break;
+      const provider = runtime.providers[request.provider];
+      calls += 1;
+      const answer = simCall(provider, request.model as string);
+      if (SIM_DEBUG) process.stderr.write(`sim: r${i + 1} -> ${provider.id} #${provider.next - 1} ${answer.ok ? 'ok' : `REFUSED ${answer.message}`} (model ${request.model})\n`);
+      if (answer.ok && answer.usage !== null) {
+        served += 1;
+        const rating = ratingOf(provider.id, answer.model) ?? request.top;
+        const unitLoss = request.weight * Math.max(0, request.top - rating);
+        loss += unitLoss;
+        runtime.lossSoFar += unitLoss;
+        break;
+      }
+      const kind = classifyRefusal(answer.message);
+      if (kind === 'budget' || kind === 'outage') provider.dead = true;
+      else if (kind === 'scheduled') {
+        provider.observedFails += 1;
+        if (provider.refusedFrom === null) provider.refusedFrom = provider.next;
+      }
+      replan(i);
+    }
+  }
+  const quality = bound === 0 ? 0 : Math.floor((100 * (bound - loss)) / bound);
+  const servedScore = Math.floor((100 * served) / Math.max(1, runtime.requests.length));
+  const score = Math.round((60 * quality + 15 * servedScore + 2500) / 100);
+  process.stdout.write(`${JSON.stringify({ calls, loss, lossBudget: runtime.lossBudget, quality, served, score })}\n`);
+}
+const SIM_ROWS = new Map<string, SimRow>();
+
+
 async function postJson(url: string, payload: Json, timeoutMs: number): Promise<{ status: number; body: string } | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1083,6 +1357,10 @@ async function pollWork(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  if (SIM_TRIAL !== '') {
+    await simMain();
+    process.exit(0);
+  }
   if (process.argv.includes('--list')) {
     const catalog = await buildCatalog(brief);
     process.stdout.write(`${JSON.stringify(catalog)}\n`);
@@ -1096,8 +1374,8 @@ async function main(): Promise<void> {
   runtime.requests = buildRequestInfos();
   let bound = 0;
   for (const request of runtime.requests) bound += request.weight * request.top;
-  runtime.lossThreshold = Math.floor(0.01 * bound);
-  log(`workload: ${runtime.requests.length} requests, quality bound ${bound}, loss budget ${runtime.lossThreshold}`);
+  runtime.lossBudget = Math.floor((1 - QUALITY_FLOOR) * bound);
+  log(`workload: ${runtime.requests.length} requests, quality bound ${bound}, loss budget ${runtime.lossBudget}`);
 
   const directory = isRecord(brief.directory) && Array.isArray(brief.directory.providers) ? brief.directory.providers : [];
   runtime.providers = directory.map((p: Json, index: number) => {
@@ -1111,10 +1389,15 @@ async function main(): Promise<void> {
       key: isRecord(p) && typeof p.key === 'string' ? p.key : '',
       next: 1,
       dead: false,
+      refusedFrom: null,
       observedFails: 0,
       servedSecond: false,
     };
   });
+
+  computePlannedCaps();
+  replan(0);
+  log(`planned caps: ${runtime.providers.map((p) => `${p.id}:${runtime.plannedMax[p.index]}`).join(' ')}`);
 
   const port = await startServer();
   log(`listening on 0.0.0.0:${port}`);
