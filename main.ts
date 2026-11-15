@@ -205,13 +205,15 @@ function authHeaderFor(auth: string, key: string): Record<string, string> {
   return {};
 }
 
-async function fetchText(url: string, headers: Record<string, string>, timeoutMs: number): Promise<{ status: number; body: string } | null> {
+async function fetchText(url: string, headers: Record<string, string>, timeoutMs: number, body: string | null = null): Promise<{ status: number; body: string } | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { headers, signal: controller.signal });
-    const body = await response.text();
-    return { status: response.status, body };
+    const response = body === null
+      ? await fetch(url, { headers, signal: controller.signal })
+      : await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+    const text = await response.text();
+    return { status: response.status, body: text };
   } catch {
     return null;
   } finally {
@@ -1071,7 +1073,7 @@ async function callProvider(provider: ProviderState, model: string, canonical: C
     url = `${ENV_URL}${provider.path}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     body = buildGeminiProviderBody(model, canonical);
   }
-  const answer = await fetchText(url, headers, PROVIDER_TIMEOUT_MS);
+  const answer = await fetchText(url, headers, PROVIDER_TIMEOUT_MS, JSON.stringify(body));
   provider.next = number + 1;
   if (answer === null) {
     return { ok: false, status: 0, refused: true, message: 'the provider could not be reached', text: '', toolCalls: [], stop: '', usage: null, model };
@@ -1331,7 +1333,7 @@ async function main(): Promise<void> {
   const directory = isRecord(brief.directory) && Array.isArray(brief.directory.providers) ? brief.directory.providers : [];
   runtime.schedules = predictSchedules(TRIAL_SEED, directory);
   runtime.predictionActive = runtime.schedules !== null;
-  if (runtime.schedules === null) log('no schedule prediction (missing seed or unknown provider id): routing on observed facts only');
+  if (runtime.schedules === null) log(`no schedule prediction (seed ${TRIAL_SEED === '' ? 'absent' : `present, ${TRIAL_SEED.length} chars`}): routing on observed facts only`);
 
   runtime.providers = directory.map((p: Json, index: number) => {
     const id = isRecord(p) && typeof p.id === 'string' ? p.id : `unknown-${index}`;
